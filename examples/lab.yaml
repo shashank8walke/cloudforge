@@ -1,0 +1,57 @@
+# CloudForge Lab Specification — example
+# Run with: cloudforge run examples/lab.yaml --html-report
+
+name: demo-smoke-lab
+provider: aws
+description: "Minimal AWS lab for smoke testing a REST API service"
+
+instance:
+  type: t3.micro
+  count: 1
+  region: us-east-1
+  ami: ami-0c02fb55956c7d316   # Amazon Linux 2023, us-east-1
+  tags:
+    Environment: test
+    Owner: qa-team
+
+network:
+  vpc_cidr: "10.0.0.0/16"
+  public_subnets:
+    - "10.0.1.0/24"
+  enable_nat_gateway: false
+
+storage:
+  bucket_name: demo-smoke-lab-artifacts
+  size_gb: 20
+  type: gp3
+
+tests:
+  - path: tests/smoke/test_connectivity.py
+    markers:
+      - smoke
+    timeout_seconds: 120
+    env_vars:
+      CLOUDFORGE_LAB_NAME: demo-smoke-lab
+      CLOUDFORGE_REGION: us-east-1
+
+  - path: tests/smoke/test_api.py
+    markers:
+      - smoke
+    timeout_seconds: 180
+    env_vars:
+      CLOUDFORGE_LAB_NAME: demo-smoke-lab
+      CLOUDFORGE_REGION: us-east-1
+      # CLOUDFORGE_API_ENDPOINT is injected automatically from Terraform outputs
+
+lifecycle:
+  on_provision:
+    - "echo 'Lab provisioned — running post-provision setup'"
+  on_teardown:
+    - "echo 'Starting teardown — archiving logs'"
+  auto_teardown: true
+  teardown_on_failure: false
+
+labels:
+  project: cloudforge-demo
+  team: qa
+  cost-center: "9000"
