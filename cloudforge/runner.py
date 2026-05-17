@@ -6,14 +6,22 @@ import os
 import subprocess
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 from rich.console import Console
 
-from cloudforge.schema import LabSpec, TestSuiteSpec
+from cloudforge.schema import LabSpec
 
 console = Console()
+
+# Maps the short test names used in lab specs to their actual file paths.
+_TEST_PATH_MAP: dict[str, str] = {
+    "connectivity": "tests/smoke/test_connectivity.py",
+    "api": "tests/smoke/test_api.py",
+    "performance": "tests/smoke/test_performance.py",
+}
+
+_DEFAULT_TIMEOUT = 300
 
 
 @dataclass
@@ -72,18 +80,13 @@ def _parse_pytest_output(stdout: str) -> dict[str, int]:
     return counts
 
 
-def _build_pytest_cmd(suite: TestSuiteSpec, outputs: dict[str, Any]) -> list[str]:
-    cmd = ["python", "-m", "pytest", suite.path, "-v", "--tb=short", "--no-header"]
-    for marker in suite.markers:
-        cmd += ["-m", marker]
-    cmd += [f"--timeout={suite.timeout_seconds}"]
-    return cmd
+def _resolve_path(test_name: str) -> str:
+    """Return the file path for a test name, falling back to the name itself."""
+    return _TEST_PATH_MAP.get(test_name.lower(), test_name)
 
 
-def _build_env(suite: TestSuiteSpec, outputs: dict[str, Any]) -> dict[str, str]:
+def _build_env(outputs: dict[str, Any]) -> dict[str, str]:
     env = os.environ.copy()
-    env.update(suite.env_vars)
-    # Inject provisioner outputs as env vars so tests can discover endpoints
     for k, v in outputs.items():
         env[f"CLOUDFORGE_{k.upper()}"] = str(v)
     return env
@@ -94,27 +97,27 @@ def run_suites(spec: LabSpec, outputs: dict[str, Any]) -> RunResult:
     result = RunResult(lab_name=spec.name)
 
     if not spec.tests:
-        console.print("[yellow]  No test suites defined in lab spec — skipping.[/]")
+        console.print("[yellow]  No tests defined in lab spec — skipping.[/]")
         return result
 
-    for suite in spec.tests:
-        console.print(f"\n[bold cyan]  Running suite:[/] {suite.path}")
+    env = _build_env(outputs)
+    env["CLOUDFORGE_LAB_NAME"] = spec.name
+    env["CLOUDFORGE_REGION"] = spec.region
+
+    for test_name in spec.tests:
+        path = _resolve_path(test_name)
+        console.print(f"\n[bold cyan]  Running suite:[/] {test_name} ({path})")
         suite_start = time.monotonic()
 
-        cmd = _build_pytest_cmd(suite, outputs)
-        env = _build_env(suite, outputs)
+        cmd = ["python", "-m", "pytest", path, "-v", "--tb=short", "--no-header",
+               f"--timeout={_DEFAULT_TIMEOUT}"]
 
         try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                env=env,
-                timeout=suite.timeout_seconds + 30,
-            )
+            proc = subprocess.run(cmd, capture_output=True, text=True, env=env,
+                                  timeout=_DEFAULT_TIMEOUT + 30)
             counts = _parse_pytest_output(proc.stdout)
             suite_result = SuiteResult(
-                suite_path=suite.path,
+                suite_path=path,
                 passed=counts["passed"],
                 failed=counts["failed"],
                 errors=counts["errors"],
@@ -124,16 +127,16 @@ def run_suites(spec: LabSpec, outputs: dict[str, Any]) -> RunResult:
                 stdout=proc.stdout,
                 stderr=proc.stderr,
             )
-        except subprocess.TimeoutExpired as exc:
+        except subprocess.TimeoutExpired:
             suite_result = SuiteResult(
-                suite_path=suite.path,
+                suite_path=path,
                 exit_code=1,
                 duration_seconds=time.monotonic() - suite_start,
-                stderr=f"Suite timed out after {suite.timeout_seconds}s",
+                stderr=f"Suite timed out after {_DEFAULT_TIMEOUT}s",
             )
         except FileNotFoundError:
             suite_result = SuiteResult(
-                suite_path=suite.path,
+                suite_path=path,
                 exit_code=1,
                 stderr="pytest / python not found in PATH",
             )

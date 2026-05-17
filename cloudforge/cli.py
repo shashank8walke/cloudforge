@@ -11,7 +11,7 @@ from rich.console import Console
 from cloudforge.provisioner import get_provisioner
 from cloudforge.reporter import build_report, print_summary, save_html, save_json
 from cloudforge.runner import run_suites
-from cloudforge.schema import load_lab_spec
+from cloudforge.schema import load_spec
 from cloudforge.teardown import run_teardown
 
 console = Console()
@@ -42,7 +42,7 @@ def cli() -> None:
 @click.option("--html-report", is_flag=True, default=False, help="Save HTML report")
 def run(spec_file: str, output_dir: str, no_teardown: bool, json_report: bool, html_report: bool) -> None:
     """Provision a lab, run tests, then tear down — full lifecycle from SPEC_FILE."""
-    spec = load_lab_spec(spec_file)
+    spec = load_spec(spec_file)
     console.print(f"[bold]Lab:[/] {spec.name}  [bold]Provider:[/] {spec.provider.value}")
 
     provisioner = get_provisioner(spec.provider)
@@ -50,21 +50,16 @@ def run(spec_file: str, output_dir: str, no_teardown: bool, json_report: bool, h
 
     run_result = None
     if provision_result.success:
-        for hook in spec.lifecycle.on_provision:
-            console.print(f"  Lifecycle hook: [dim]{hook}[/]")
-            import subprocess
-            subprocess.run(hook, shell=True)
-
         run_result = run_suites(spec, provision_result.outputs)
     else:
         console.print(f"[red]Provisioning failed — skipping tests.[/]\n{provision_result.error}")
 
     teardown_result = None
-    should_teardown = (
-        not no_teardown
-        and spec.lifecycle.auto_teardown
-        and (provision_result.success or spec.lifecycle.teardown_on_failure)
-        and (run_result is None or run_result.success or spec.lifecycle.teardown_on_failure)
+    tests_ok = run_result is None or run_result.success
+    overall_ok = provision_result.success and tests_ok
+    should_teardown = not no_teardown and (
+        (overall_ok and spec.teardown_on_success)
+        or (not overall_ok and spec.teardown_on_failure)
     )
 
     if should_teardown:
@@ -86,7 +81,7 @@ def run(spec_file: str, output_dir: str, no_teardown: bool, json_report: bool, h
 @click.argument("spec_file", type=click.Path(exists=True, dir_okay=False))
 def provision(spec_file: str) -> None:
     """Provision a lab environment without running tests."""
-    spec = load_lab_spec(spec_file)
+    spec = load_spec(spec_file)
     console.print(f"[bold]Provisioning:[/] {spec.name} on {spec.provider.value}")
     provisioner = get_provisioner(spec.provider)
     result = provisioner.provision(spec)
@@ -100,7 +95,7 @@ def provision(spec_file: str) -> None:
 @click.argument("spec_file", type=click.Path(exists=True, dir_okay=False))
 def test(spec_file: str) -> None:
     """Run test suites against an already-provisioned lab."""
-    spec = load_lab_spec(spec_file)
+    spec = load_spec(spec_file)
     console.print(f"[bold]Testing:[/] {spec.name}")
     result = run_suites(spec, {})
     sys.exit(0 if result.success else 1)
@@ -110,7 +105,7 @@ def test(spec_file: str) -> None:
 @click.argument("spec_file", type=click.Path(exists=True, dir_okay=False))
 def destroy(spec_file: str) -> None:
     """Tear down all resources for a lab."""
-    spec = load_lab_spec(spec_file)
+    spec = load_spec(spec_file)
     console.print(f"[bold]Destroying:[/] {spec.name}")
     result = run_teardown(spec)
     if not result.success:
@@ -123,11 +118,12 @@ def destroy(spec_file: str) -> None:
 def validate(spec_file: str) -> None:
     """Validate a lab YAML spec without provisioning anything."""
     try:
-        spec = load_lab_spec(spec_file)
+        spec = load_spec(spec_file)
         console.print(f"[green]Valid[/] — lab=[bold]{spec.name}[/] provider=[bold]{spec.provider.value}[/]")
-        console.print(f"  Instances: {spec.instance.count}x {spec.instance.type} in {spec.instance.region}")
-        console.print(f"  Test suites: {len(spec.tests)}")
-        console.print(f"  Auto-teardown: {spec.lifecycle.auto_teardown}")
+        console.print(f"  Instance:       {spec.instance_type} in {spec.region}")
+        console.print(f"  Storage:        {spec.storage_gb} GB")
+        console.print(f"  Tests:          {', '.join(spec.tests)}")
+        console.print(f"  Teardown:       on_success={spec.teardown_on_success}  on_failure={spec.teardown_on_failure}")
     except Exception as exc:
         console.print(f"[red]Invalid spec:[/] {exc}")
         sys.exit(1)

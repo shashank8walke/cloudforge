@@ -31,16 +31,6 @@ class TeardownResult:
     error: str | None = None
 
 
-def _run_hook(cmd: str) -> tuple[bool, str]:
-    try:
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
-        return result.returncode == 0, result.stdout + result.stderr
-    except subprocess.TimeoutExpired:
-        return False, f"Hook timed out: {cmd}"
-    except Exception as exc:
-        return False, str(exc)
-
-
 def _terraform_destroy(tf_dir: Path, var_file: Path | None = None) -> tuple[bool, str]:
     cmd = ["terraform", "destroy", "-auto-approve", "-no-color"]
     if var_file and var_file.exists():
@@ -57,13 +47,6 @@ def _terraform_destroy(tf_dir: Path, var_file: Path | None = None) -> tuple[bool
 def run_teardown(spec: LabSpec) -> TeardownResult:
     start = time.monotonic()
     console.print(f"\n[bold yellow]  Teardown:[/] {spec.name} ({spec.provider.value})")
-
-    # Run on_teardown lifecycle hooks first
-    for hook in spec.lifecycle.on_teardown:
-        console.print(f"  Running hook: [dim]{hook}[/]")
-        ok, out = _run_hook(hook)
-        if not ok:
-            console.print(f"  [yellow]Hook warning:[/] {out[:200]}")
 
     tf_dir = _TF_DIRS.get(spec.provider)
     if tf_dir is None:

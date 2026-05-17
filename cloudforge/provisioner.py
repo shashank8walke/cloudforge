@@ -69,7 +69,14 @@ class AWSProvisioner(BaseProvisioner):
 
     def _write_var_file(self, spec: LabSpec, tf_dir: Path) -> Path:
         var_file = tf_dir / f"{spec.name}.auto.tfvars.json"
-        var_file.write_text(json.dumps(spec.to_terraform_vars(), indent=2))
+        vars_ = {
+            "lab_name": spec.name,
+            "region": spec.region,
+            "instance_type": spec.instance_type,
+            "instance_count": 1,
+            "tags": {**spec.tags, "ManagedBy": "cloudforge", "Lab": spec.name},
+        }
+        var_file.write_text(json.dumps(vars_, indent=2))
         return var_file
 
     def provision(self, spec: LabSpec) -> ProvisionResult:
@@ -110,7 +117,7 @@ class AWSProvisioner(BaseProvisioner):
         return {}
 
     def list_lab_instances(self, spec: LabSpec) -> list[dict[str, Any]]:
-        ec2 = self._ec2_client(spec.instance.region)
+        ec2 = self._ec2_client(spec.region)
         response = ec2.describe_instances(
             Filters=[{"Name": "tag:Lab", "Values": [spec.name]}, {"Name": "instance-state-name", "Values": ["running", "pending"]}]
         )
