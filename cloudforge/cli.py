@@ -3,18 +3,52 @@
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 import click
+from botocore.exceptions import ClientError
 from rich.console import Console
 
-from cloudforge.provisioner import get_provisioner
+from cloudforge.provisioner import ProvisionResult, get_provisioner
 from cloudforge.reporter import build_report, print_summary, save_html, save_json
 from cloudforge.runner import run_suites
 from cloudforge.schema import load_spec
 from cloudforge.teardown import run_teardown
 
 console = Console()
+
+def _run_provision(provisioner, spec) -> ProvisionResult:
+    """Call provisioner.provision() and normalise the result into ProvisionResult."""
+    start = time.monotonic()
+    try:
+        outputs = provisioner.provision()
+        return ProvisionResult(
+            success=True,
+            provider=spec.provider.value,
+            lab_name=spec.name,
+            outputs=outputs,
+            elapsed_seconds=time.monotonic() - start,
+        )
+    except ClientError as exc:
+        code = exc.response["Error"]["Code"]
+        msg = exc.response["Error"]["Message"]
+        return ProvisionResult(
+            success=False,
+            provider=spec.provider.value,
+            lab_name=spec.name,
+            error=f"{code}: {msg}",
+            elapsed_seconds=time.monotonic() - start,
+        )
+    except NotImplementedError as exc:
+        return ProvisionResult(
+            success=False,
+            provider=spec.provider.value,
+            lab_name=spec.name,
+            error=str(exc),
+            elapsed_seconds=time.monotonic() - start,
+        )
+
 
 _BANNER = r"""
   ___  _                 _ _____
@@ -45,8 +79,8 @@ def run(spec_file: str, output_dir: str, no_teardown: bool, json_report: bool, h
     spec = load_spec(spec_file)
     console.print(f"[bold]Lab:[/] {spec.name}  [bold]Provider:[/] {spec.provider.value}")
 
-    provisioner = get_provisioner(spec.provider)
-    provision_result = provisioner.provision(spec)
+    provisioner = get_provisioner(spec.provider, spec)
+    provision_result = _run_provision(provisioner, spec)
 
     run_result = None
     if provision_result.success:
@@ -83,8 +117,8 @@ def provision(spec_file: str) -> None:
     """Provision a lab environment without running tests."""
     spec = load_spec(spec_file)
     console.print(f"[bold]Provisioning:[/] {spec.name} on {spec.provider.value}")
-    provisioner = get_provisioner(spec.provider)
-    result = provisioner.provision(spec)
+    provisioner = get_provisioner(spec.provider, spec)
+    result = _run_provision(provisioner, spec)
     if not result.success:
         console.print(f"[red]Failed:[/] {result.error}")
         sys.exit(1)

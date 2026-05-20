@@ -2,22 +2,22 @@
 
 from __future__ import annotations
 
-import json
-import subprocess
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import boto3
+from botocore.exceptions import ClientError
 from rich.console import Console
 
 from cloudforge.schema import CloudProvider, LabSpec
 
 console = Console()
 
-TERRAFORM_AWS_DIR = Path(__file__).parent.parent / "terraform" / "aws"
-TERRAFORM_GCP_DIR = Path(__file__).parent.parent / "terraform" / "gcp"
+# AMI for Amazon Linux 2 in us-east-1.
+# Other regions need their own AMI IDs; this is used as the default.
+_DEFAULT_AMI = "ami-0c02fb55956c7d316"
 
 
 @dataclass
@@ -30,125 +30,246 @@ class ProvisionResult:
     elapsed_seconds: float = 0.0
 
 
+# ---------------------------------------------------------------------------
+# Base class
+# ---------------------------------------------------------------------------
+
 class BaseProvisioner:
-    def provision(self, spec: LabSpec) -> ProvisionResult:
+    """Interface every provider must implement."""
+
+    def __init__(self, spec: LabSpec) -> None:
+        self.spec = spec
+        self.resources: dict[str, str] = {}
+
+    def provision(self) -> dict:
         raise NotImplementedError
 
-    def get_outputs(self, spec: LabSpec) -> dict[str, Any]:
+    def get_status(self) -> str:
         raise NotImplementedError
 
+    def tag_resources(self, resources: dict) -> None:
+        raise NotImplementedError
+
+
+# ---------------------------------------------------------------------------
+# AWS
+# ---------------------------------------------------------------------------
 
 class AWSProvisioner(BaseProvisioner):
-    """Provisions AWS resources via Terraform + boto3 health checks."""
+    """Provisions an EC2 instance + S3 bucket directly via boto3."""
 
-    def __init__(self) -> None:
-        self._ec2 = None
-        self._s3 = None
+    def __init__(self, spec: LabSpec) -> None:
+        super().__init__(spec)
+        self._ec2 = boto3.client("ec2", region_name=spec.region)
+        self._s3 = boto3.client("s3", region_name=spec.region)
 
-    def _ec2_client(self, region: str):
-        if self._ec2 is None:
-            self._ec2 = boto3.client("ec2", region_name=region)
-        return self._ec2
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
-    def _s3_client(self):
-        if self._s3 is None:
-            self._s3 = boto3.client("s3")
-        return self._s3
+    def provision(self) -> dict:
+        """
+        Create one EC2 t2.micro instance and one S3 bucket.
 
-    def _run_terraform(self, tf_dir: Path, action: str, var_file: Path | None = None) -> tuple[bool, str]:
-        cmd = ["terraform", action, "-auto-approve", "-no-color"]
-        if var_file:
-            cmd += [f"-var-file={var_file}"]
-        try:
-            result = subprocess.run(cmd, cwd=tf_dir, capture_output=True, text=True, timeout=600)
-            return result.returncode == 0, result.stdout + result.stderr
-        except FileNotFoundError:
-            return False, "terraform binary not found — install Terraform >= 1.6"
-        except subprocess.TimeoutExpired:
-            return False, "Terraform timed out after 600 s"
+        Waits until the instance reaches the *running* state, then tags
+        both resources.  Stores all IDs in ``self.resources`` so teardown
+        can find them.
 
-    def _write_var_file(self, spec: LabSpec, tf_dir: Path) -> Path:
-        var_file = tf_dir / f"{spec.name}.auto.tfvars.json"
-        vars_ = {
-            "lab_name": spec.name,
-            "region": spec.region,
-            "instance_type": spec.instance_type,
-            "instance_count": 1,
-            "tags": {**spec.tags, "ManagedBy": "cloudforge", "Lab": spec.name},
-        }
-        var_file.write_text(json.dumps(vars_, indent=2))
-        return var_file
+        Returns:
+            {"instance_id": str, "public_ip": str, "s3_bucket": str}
 
-    def provision(self, spec: LabSpec) -> ProvisionResult:
+        Raises:
+            botocore.exceptions.ClientError on any AWS API failure.
+        """
         start = time.monotonic()
-        console.print(f"[bold cyan]  Provisioning AWS lab:[/] {spec.name}")
+        console.print(f"\n[bold cyan]  Provisioning AWS lab:[/] {self.spec.name}")
 
-        var_file = self._write_var_file(spec, TERRAFORM_AWS_DIR)
+        self._launch_ec2()
+        self._wait_for_running()
+        self._fetch_public_ip()
+        self._create_s3_bucket()
+        self.tag_resources(self.resources)
 
-        console.print("  Running [green]terraform init[/]…")
-        ok, out = self._run_terraform(TERRAFORM_AWS_DIR, "init")
-        if not ok:
-            return ProvisionResult(False, "aws", spec.name, error=out, elapsed_seconds=time.monotonic() - start)
-
-        console.print("  Running [green]terraform apply[/]…")
-        ok, out = self._run_terraform(TERRAFORM_AWS_DIR, "apply", var_file)
-        if not ok:
-            return ProvisionResult(False, "aws", spec.name, error=out, elapsed_seconds=time.monotonic() - start)
-
-        outputs = self.get_outputs(spec)
         elapsed = time.monotonic() - start
         console.print(f"[bold green]  AWS lab provisioned in {elapsed:.1f}s[/]")
-        return ProvisionResult(True, "aws", spec.name, outputs=outputs, elapsed_seconds=elapsed)
+        return dict(self.resources)
 
-    def get_outputs(self, spec: LabSpec) -> dict[str, Any]:
+    def get_status(self) -> str:
+        """
+        Return the EC2 instance state name (e.g. 'running', 'stopped').
+
+        Returns 'not_provisioned' if no instance has been launched yet,
+        or 'error: <code>' if the describe call fails.
+        """
+        instance_id = self.resources.get("instance_id")
+        if not instance_id:
+            return "not_provisioned"
         try:
-            result = subprocess.run(
-                ["terraform", "output", "-json"],
-                cwd=TERRAFORM_AWS_DIR,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            if result.returncode == 0:
-                raw = json.loads(result.stdout)
-                return {k: v.get("value") for k, v in raw.items()}
-        except Exception:
-            pass
-        return {}
+            resp = self._ec2.describe_instances(InstanceIds=[instance_id])
+            reservations = resp.get("Reservations", [])
+            if not reservations:
+                return "terminated"
+            return reservations[0]["Instances"][0]["State"]["Name"]
+        except ClientError as exc:
+            return f"error: {exc.response['Error']['Code']}"
 
-    def list_lab_instances(self, spec: LabSpec) -> list[dict[str, Any]]:
-        ec2 = self._ec2_client(spec.region)
-        response = ec2.describe_instances(
-            Filters=[{"Name": "tag:Lab", "Values": [spec.name]}, {"Name": "instance-state-name", "Values": ["running", "pending"]}]
+    def tag_resources(self, resources: dict) -> None:
+        """
+        Apply spec tags + standard CloudForge tags to every provisioned resource.
+
+        Non-fatal: logs a warning on failure rather than raising so that a
+        tagging hiccup never blocks provisioning or teardown.
+        """
+        standard = {"ManagedBy": "cloudforge", "Lab": self.spec.name}
+        merged = {**self.spec.tags, **standard}
+        ec2_tags = [{"Key": k, "Value": v} for k, v in merged.items()]
+
+        if "instance_id" in resources:
+            try:
+                self._ec2.create_tags(
+                    Resources=[resources["instance_id"]],
+                    Tags=ec2_tags,
+                )
+                console.print("  [green]✓[/] Tagged EC2 instance.")
+            except ClientError as exc:
+                console.print(
+                    f"  [yellow]⚠ Tagging instance failed:[/] "
+                    f"{exc.response['Error']['Code']}"
+                )
+
+        if "s3_bucket" in resources:
+            try:
+                self._s3.put_bucket_tagging(
+                    Bucket=resources["s3_bucket"],
+                    Tagging={"TagSet": ec2_tags},
+                )
+                console.print("  [green]✓[/] Tagged S3 bucket.")
+            except ClientError as exc:
+                console.print(
+                    f"  [yellow]⚠ Tagging bucket failed:[/] "
+                    f"{exc.response['Error']['Code']}"
+                )
+
+    # ------------------------------------------------------------------
+    # Private helpers (each step of provision)
+    # ------------------------------------------------------------------
+
+    def _launch_ec2(self) -> None:
+        console.print(
+            f"  [cyan]→[/] Launching EC2 instance "
+            f"[dim]({self.spec.instance_type}, {self.spec.region})[/]…"
         )
-        instances = []
-        for reservation in response.get("Reservations", []):
-            for inst in reservation.get("Instances", []):
-                instances.append({"id": inst["InstanceId"], "state": inst["State"]["Name"], "public_ip": inst.get("PublicIpAddress")})
-        return instances
+        try:
+            resp = self._ec2.run_instances(
+                ImageId=_DEFAULT_AMI,
+                InstanceType=self.spec.instance_type,
+                MinCount=1,
+                MaxCount=1,
+                TagSpecifications=[
+                    {
+                        "ResourceType": "instance",
+                        "Tags": [
+                            {"Key": "Name", "Value": f"cloudforge-{self.spec.name}"},
+                            {"Key": "Lab", "Value": self.spec.name},
+                            {"Key": "ManagedBy", "Value": "cloudforge"},
+                        ],
+                    }
+                ],
+            )
+            instance_id = resp["Instances"][0]["InstanceId"]
+            self.resources["instance_id"] = instance_id
+            console.print(f"  [green]✓[/] Instance launched: [bold]{instance_id}[/]")
+        except ClientError as exc:
+            code = exc.response["Error"]["Code"]
+            msg = exc.response["Error"]["Message"]
+            console.print(f"  [red]✗ EC2 launch failed:[/] {code} — {msg}")
+            raise
 
+    def _wait_for_running(self) -> None:
+        instance_id = self.resources["instance_id"]
+        console.print("  [cyan]→[/] Waiting for instance to reach [bold]running[/] state…")
+        try:
+            waiter = self._ec2.get_waiter("instance_running")
+            waiter.wait(
+                InstanceIds=[instance_id],
+                WaiterConfig={"Delay": 5, "MaxAttempts": 40},
+            )
+            console.print("  [green]✓[/] Instance is running.")
+        except ClientError as exc:
+            code = exc.response["Error"]["Code"]
+            msg = exc.response["Error"]["Message"]
+            console.print(f"  [red]✗ Waiter error:[/] {code} — {msg}")
+            raise
+
+    def _fetch_public_ip(self) -> None:
+        instance_id = self.resources["instance_id"]
+        resp = self._ec2.describe_instances(InstanceIds=[instance_id])
+        public_ip: str = (
+            resp["Reservations"][0]["Instances"][0].get("PublicIpAddress") or ""
+        )
+        self.resources["public_ip"] = public_ip
+        console.print(f"  [green]✓[/] Public IP: [bold]{public_ip or '(none assigned)'}[/]")
+
+    def _create_s3_bucket(self) -> None:
+        bucket_name = f"cloudforge-{self.spec.name}-{uuid4().hex[:8]}"
+        console.print(f"  [cyan]→[/] Creating S3 bucket [dim]{bucket_name}[/]…")
+        try:
+            # us-east-1 is the default region and must NOT include LocationConstraint
+            if self.spec.region == "us-east-1":
+                self._s3.create_bucket(Bucket=bucket_name)
+            else:
+                self._s3.create_bucket(
+                    Bucket=bucket_name,
+                    CreateBucketConfiguration={"LocationConstraint": self.spec.region},
+                )
+            self.resources["s3_bucket"] = bucket_name
+            console.print(f"  [green]✓[/] S3 bucket created: [bold]{bucket_name}[/]")
+        except ClientError as exc:
+            code = exc.response["Error"]["Code"]
+            msg = exc.response["Error"]["Message"]
+            console.print(f"  [red]✗ S3 creation failed:[/] {code} — {msg}")
+            raise
+
+
+# ---------------------------------------------------------------------------
+# GCP stub
+# ---------------------------------------------------------------------------
 
 class GCPProvisioner(BaseProvisioner):
-    """Stub — GCP provisioner (Phase 2)."""
+    """Stub — GCP provisioner (future phase)."""
 
-    def provision(self, spec: LabSpec) -> ProvisionResult:
-        console.print("[yellow]  GCP provisioner is a stub — not yet implemented.[/]")
-        return ProvisionResult(False, "gcp", spec.name, error="GCP provisioner not implemented in Phase 1")
+    def provision(self) -> dict:
+        console.print("[yellow]  GCP provisioner is not yet implemented.[/]")
+        raise NotImplementedError("GCP provisioner not implemented")
 
-    def get_outputs(self, spec: LabSpec) -> dict[str, Any]:
-        return {}
+    def get_status(self) -> str:
+        return "not_provisioned"
 
+    def tag_resources(self, resources: dict) -> None:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Azure stub
+# ---------------------------------------------------------------------------
 
 class AzureProvisioner(BaseProvisioner):
-    """Stub — Azure provisioner (Phase 2)."""
+    """Stub — Azure provisioner (future phase)."""
 
-    def provision(self, spec: LabSpec) -> ProvisionResult:
-        console.print("[yellow]  Azure provisioner is a stub — not yet implemented.[/]")
-        return ProvisionResult(False, "azure", spec.name, error="Azure provisioner not implemented in Phase 1")
+    def provision(self) -> dict:
+        console.print("[yellow]  Azure provisioner is not yet implemented.[/]")
+        raise NotImplementedError("Azure provisioner not implemented")
 
-    def get_outputs(self, spec: LabSpec) -> dict[str, Any]:
-        return {}
+    def get_status(self) -> str:
+        return "not_provisioned"
 
+    def tag_resources(self, resources: dict) -> None:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Registry + factory
+# ---------------------------------------------------------------------------
 
 _REGISTRY: dict[CloudProvider, type[BaseProvisioner]] = {
     CloudProvider.aws: AWSProvisioner,
@@ -157,8 +278,9 @@ _REGISTRY: dict[CloudProvider, type[BaseProvisioner]] = {
 }
 
 
-def get_provisioner(provider: CloudProvider) -> BaseProvisioner:
+def get_provisioner(provider: CloudProvider, spec: LabSpec) -> BaseProvisioner:
+    """Return an initialised provisioner for *provider*, bound to *spec*."""
     cls = _REGISTRY.get(provider)
     if cls is None:
         raise ValueError(f"Unknown provider: {provider}")
-    return cls()
+    return cls(spec)
