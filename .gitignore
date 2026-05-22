@@ -44,3 +44,6 @@ Thumbs.db
 
 # MyPy
 .mypy_cache/
+
+# CloudForge runtime state (live resource IDs — never commit)
+.cloudforge_state.json

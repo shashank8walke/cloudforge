@@ -1,118 +1,95 @@
-"""Smoke tests — API / metadata endpoint checks for provisioned lab resources."""
+"""
+Smoke tests — AWS API checks against provisioned resources.
+
+Verifies that the EC2 instance is in the running state via describe_instances
+and that the S3 bucket supports basic object operations (put → get → delete).
+"""
 
 from __future__ import annotations
 
-import json
-import os
-import urllib.request
-import urllib.error
+import uuid
 
+import boto3
 import pytest
+from botocore.exceptions import ClientError
+
+pytestmark = pytest.mark.smoke
+
+# Prefix for all objects written by these tests so they are easy to identify.
+_OBJECT_PREFIX = "cloudforge-smoke/"
 
 
-API_ENDPOINT = os.getenv("CLOUDFORGE_API_ENDPOINT")
-LAB_NAME = os.getenv("CLOUDFORGE_LAB_NAME", "unknown-lab")
-AWS_REGION = os.getenv("CLOUDFORGE_REGION", "us-east-1")
+def test_aws_describe_instance(instance_id: str, aws_region: str) -> None:
+    """
+    EC2 instance must be in the 'running' state.
 
-# EC2 instance metadata v2 — only valid if tests run ON the instance
-_IMDS_TOKEN_URL = "http://169.254.169.254/latest/api/token"
-_IMDS_META_URL = "http://169.254.169.254/latest/meta-data/"
+    Uses describe_instances rather than describe_instance_status so the call
+    works even when the instance's status checks haven't completed yet.
+    """
+    ec2 = boto3.client("ec2", region_name=aws_region)
 
-
-def _fetch_json(url: str, timeout: int = 10, headers: dict | None = None) -> dict:
-    req = urllib.request.Request(url, headers=headers or {})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read())
-
-
-def _is_on_ec2() -> bool:
     try:
-        req = urllib.request.Request(_IMDS_TOKEN_URL, method="PUT", headers={"X-aws-ec2-metadata-token-ttl-seconds": "10"})
-        with urllib.request.urlopen(req, timeout=2):
-            return True
-    except Exception:
-        return False
+        resp = ec2.describe_instances(InstanceIds=[instance_id])
+    except ClientError as exc:
+        code = exc.response["Error"]["Code"]
+        pytest.fail(f"describe_instances failed: {code}")
+
+    reservations = resp.get("Reservations", [])
+    assert reservations, f"No reservation returned for instance '{instance_id}'"
+
+    instance = reservations[0]["Instances"][0]
+    state = instance["State"]["Name"]
+
+    assert state == "running", (
+        f"Instance '{instance_id}' is in state '{state}' — expected 'running'.\n"
+        f"  Launch time : {instance.get('LaunchTime')}\n"
+        f"  AZ          : {instance.get('Placement', {}).get('AvailabilityZone')}"
+    )
 
 
-@pytest.mark.smoke
-class TestAPIEndpoints:
-    @pytest.mark.skipif(not API_ENDPOINT, reason="CLOUDFORGE_API_ENDPOINT not set")
-    def test_api_health_check(self):
-        """/health (or /healthz) must return HTTP 200."""
-        health_url = API_ENDPOINT.rstrip("/") + "/health"
-        try:
-            with urllib.request.urlopen(health_url, timeout=10) as resp:
-                assert resp.status == 200, f"Health check returned HTTP {resp.status}"
-        except urllib.error.HTTPError as exc:
-            # Some services use /healthz
-            if exc.code == 404:
-                healthz_url = API_ENDPOINT.rstrip("/") + "/healthz"
-                with urllib.request.urlopen(healthz_url, timeout=10) as resp:
-                    assert resp.status == 200
-            else:
-                pytest.fail(f"Health check HTTP {exc.code}")
+def test_s3_put_get(bucket_name: str) -> None:
+    """
+    S3 bucket must support put → get → verify → delete round-trip.
 
-    @pytest.mark.skipif(not API_ENDPOINT, reason="CLOUDFORGE_API_ENDPOINT not set")
-    def test_api_returns_json(self):
-        """Root API endpoint must return valid JSON."""
-        try:
-            data = _fetch_json(API_ENDPOINT, headers={"Accept": "application/json"})
-            assert isinstance(data, (dict, list)), f"Expected JSON object/array, got {type(data)}"
-        except (json.JSONDecodeError, urllib.error.URLError) as exc:
-            pytest.fail(f"API did not return JSON: {exc}")
+    A unique key is used on every run so parallel test sessions never
+    collide, and cleanup always happens (even when an assertion fails).
+    """
+    s3 = boto3.client("s3")
+    key = f"{_OBJECT_PREFIX}test-{uuid.uuid4().hex[:12]}.txt"
+    expected_body = f"cloudforge-smoke-test:{key}"
 
-    @pytest.mark.skipif(not API_ENDPOINT, reason="CLOUDFORGE_API_ENDPOINT not set")
-    def test_api_response_time(self):
-        """API must respond within 5 seconds."""
-        import time
-        start = time.monotonic()
-        try:
-            with urllib.request.urlopen(API_ENDPOINT, timeout=5):
-                pass
-        except urllib.error.URLError as exc:
-            pytest.fail(f"API unreachable: {exc}")
-        elapsed = time.monotonic() - start
-        assert elapsed < 5.0, f"API too slow: {elapsed:.2f}s"
-
-
-@pytest.mark.smoke
-class TestAWSMetadata:
-    @pytest.mark.skipif(not _is_on_ec2(), reason="Not running on an EC2 instance")
-    def test_imds_token_fetch(self):
-        """EC2 IMDSv2 token must be obtainable."""
-        req = urllib.request.Request(
-            _IMDS_TOKEN_URL,
-            method="PUT",
-            headers={"X-aws-ec2-metadata-token-ttl-seconds": "10"},
+    # ── PUT ───────────────────────────────────────────────────────────────────
+    try:
+        s3.put_object(
+            Bucket=bucket_name,
+            Key=key,
+            Body=expected_body.encode("utf-8"),
+            ContentType="text/plain",
         )
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            token = resp.read().decode()
-        assert len(token) > 0, "IMDS returned empty token"
-
-    @pytest.mark.skipif(not _is_on_ec2(), reason="Not running on an EC2 instance")
-    def test_imds_instance_id_present(self):
-        """EC2 instance-id metadata must be reachable via IMDSv2."""
-        token_req = urllib.request.Request(
-            _IMDS_TOKEN_URL,
-            method="PUT",
-            headers={"X-aws-ec2-metadata-token-ttl-seconds": "10"},
+    except ClientError as exc:
+        pytest.fail(
+            f"PUT s3://{bucket_name}/{key} failed: "
+            f"{exc.response['Error']['Code']}"
         )
-        with urllib.request.urlopen(token_req, timeout=5) as resp:
-            token = resp.read().decode()
 
-        id_req = urllib.request.Request(
-            _IMDS_META_URL + "instance-id",
-            headers={"X-aws-ec2-metadata-token": token},
+    # ── GET + verify ──────────────────────────────────────────────────────────
+    try:
+        resp = s3.get_object(Bucket=bucket_name, Key=key)
+        retrieved_body = resp["Body"].read().decode("utf-8")
+    except ClientError as exc:
+        pytest.fail(
+            f"GET s3://{bucket_name}/{key} failed: "
+            f"{exc.response['Error']['Code']}"
         )
-        with urllib.request.urlopen(id_req, timeout=5) as resp:
-            instance_id = resp.read().decode()
-        assert instance_id.startswith("i-"), f"Unexpected instance id: {instance_id}"
+    finally:
+        # ── DELETE (best-effort cleanup) ──────────────────────────────────────
+        try:
+            s3.delete_object(Bucket=bucket_name, Key=key)
+        except ClientError:
+            pass  # test result is already determined; log nothing extra
 
-    def test_lab_name_env_var(self):
-        """CLOUDFORGE_LAB_NAME must be injected by the runner."""
-        assert LAB_NAME != "unknown-lab", "CLOUDFORGE_LAB_NAME was not injected — run via `cloudforge run`"
-
-    def test_aws_region_env_var(self):
-        """CLOUDFORGE_REGION must be set and non-empty."""
-        assert AWS_REGION, "CLOUDFORGE_REGION is not set"
-        assert len(AWS_REGION) >= 9, f"Region looks malformed: {AWS_REGION}"
+    assert retrieved_body == expected_body, (
+        f"Object body mismatch.\n"
+        f"  Expected : {expected_body!r}\n"
+        f"  Got      : {retrieved_body!r}"
+    )

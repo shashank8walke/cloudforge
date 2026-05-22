@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -91,6 +93,10 @@ class AWSProvisioner(BaseProvisioner):
         self.tag_resources(self.resources)
 
         elapsed = time.monotonic() - start
+        self.resources["launch_time"] = round(elapsed, 2)
+        self.resources["region"] = self.spec.region
+        self._write_state_file()
+
         console.print(f"[bold green]  AWS lab provisioned in {elapsed:.1f}s[/]")
         return dict(self.resources)
 
@@ -153,6 +159,22 @@ class AWSProvisioner(BaseProvisioner):
     # ------------------------------------------------------------------
     # Private helpers (each step of provision)
     # ------------------------------------------------------------------
+
+    def _write_state_file(self) -> None:
+        """
+        Persist self.resources to .cloudforge_state.json in the working directory.
+
+        This file is read by tests/smoke/conftest.py so the pytest fixtures
+        can discover the provisioned resource IDs without environment variables.
+        The file is listed in .gitignore — it contains live resource IDs that
+        are environment-specific and must not be committed.
+        """
+        state_path = Path(".cloudforge_state.json")
+        state_path.write_text(
+            json.dumps(self.resources, indent=2, default=str),
+            encoding="utf-8",
+        )
+        console.print(f"  [dim]State written → {state_path}[/]")
 
     def _launch_ec2(self) -> None:
         console.print(
