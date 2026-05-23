@@ -1030,3 +1030,670 @@ The `_REGISTRY` + `BaseProvisioner` pattern means the CLI works without GCP/Azur
 
 *Last updated: Phase 2 — May 2026*  
 *Repository: https://github.com/shashank8walke/cloudforge*
+
+---
+
+# CloudForge — Phases 3 – 6 Reference
+
+> This section continues the Phase 1 & 2 reference above.  
+> Phases 3–6 build on each other: real AWS provisioning (3), production Terraform (4),
+> fixture-based smoke tests (5), and a fully polished CLI (6).
+
+---
+
+## 11. Phase 3 — Direct boto3 AWS Provisioner (no Terraform)
+
+### Goal
+
+Replace the Terraform-subprocess approach inside `AWSProvisioner` with **direct AWS API calls** via boto3. This removes the Terraform dependency from the provision path, gives instant feedback, and makes the code easier to unit-test with `moto` (AWS mocking library).
+
+### Why replace Terraform in the provisioner?
+
+| Concern | Terraform subprocess | Direct boto3 |
+|---|---|---|
+| Speed | ~60 s (init + apply) | ~30–90 s (waiter-gated) |
+| Output parsing | Parse JSON from stdout | Native Python dict |
+| Error handling | Parse stderr text | `ClientError` exception |
+| Unit testing | Hard — needs Terraform binary | Easy — `moto` patches boto3 |
+| State tracking | `.tfstate` file | `self.resources` dict |
+
+### What Changed
+
+#### `cloudforge/provisioner.py` — full rewrite
+
+**`BaseProvisioner`** interface simplified to three methods:
+```python
+def provision(self) -> dict:   raise NotImplementedError
+def get_status(self) -> str:   raise NotImplementedError
+def tag_resources(self, resources: dict) -> None: raise NotImplementedError
+```
+The `spec` is now stored at `__init__` time (`self.spec = spec`) so `provision()` takes no arguments — the provisioner is bound to one spec.
+
+**`AWSProvisioner.__init__`** creates the two boto3 clients up front:
+```python
+self._ec2 = boto3.client("ec2", region_name=spec.region)
+self._s3  = boto3.client("s3",  region_name=spec.region)
+```
+
+**`AWSProvisioner.provision()`** — four private methods called in sequence:
+```python
+self._launch_ec2()       # run_instances → stores instance_id
+self._wait_for_running() # get_waiter("instance_running"), Delay=5, MaxAttempts=40
+self._fetch_public_ip()  # describe_instances → stores public_ip
+self._create_s3_bucket() # create_bucket → stores s3_bucket name
+self.tag_resources(self.resources)
+```
+
+**`_create_s3_bucket()`** — name pattern: `cloudforge-{spec.name}-{uuid4().hex[:8]}`.  
+Important: `us-east-1` must **not** include `CreateBucketConfiguration.LocationConstraint` — AWS rejects it.
+
+```python
+if self.spec.region == "us-east-1":
+    self._s3.create_bucket(Bucket=bucket_name)
+else:
+    self._s3.create_bucket(
+        Bucket=bucket_name,
+        CreateBucketConfiguration={"LocationConstraint": self.spec.region},
+    )
+```
+
+**`_DEFAULT_AMI = "ami-0c02fb55956c7d316"`** — Amazon Linux 2 in `us-east-1`. Other regions require their own AMI IDs.
+
+**`tag_resources()`** — merges spec tags with `{"ManagedBy": "cloudforge", "Lab": spec.name}`. Uses `create_tags` for EC2 and `put_bucket_tagging` for S3. Non-fatal: logs a yellow warning on `ClientError` rather than raising, so a tagging hiccup never blocks provisioning.
+
+**`get_status()`** — calls `describe_instances` and returns the `State.Name` string (`"running"`, `"stopped"`, `"terminated"`). Returns `"not_provisioned"` if `self.resources` has no `instance_id`. Returns `"error: <Code>"` on `ClientError`.
+
+#### `cloudforge/cli.py` — `_run_provision()` helper
+
+Because `provisioner.provision()` now returns a raw `dict` (not a `ProvisionResult`), the CLI wraps it:
+
+```python
+def _run_provision(provisioner, spec) -> ProvisionResult:
+    start = time.monotonic()
+    try:
+        outputs = provisioner.provision()   # dict
+        return ProvisionResult(success=True, outputs=outputs, ...)
+    except ClientError as exc:
+        return ProvisionResult(success=False, error=f"{code}: {msg}", ...)
+    except NotImplementedError as exc:
+        return ProvisionResult(success=False, error=str(exc), ...)
+```
+
+This keeps `reporter.py` working (it still receives `ProvisionResult`) while the provisioner API is clean.
+
+### `get_provisioner()` signature change
+
+```python
+# Phase 1 (old)
+get_provisioner(provider: CloudProvider) -> BaseProvisioner  # caller passes spec later
+# Phase 3 (new)
+get_provisioner(provider: CloudProvider, spec: LabSpec) -> BaseProvisioner  # spec bound at construction
+```
+
+The provisioner is now bound to a spec from the start — no spec argument needed on `provision()`.
+
+### Key boto3 Concepts
+
+| API call | What it does |
+|---|---|
+| `run_instances(ImageId, InstanceType, MinCount=1, MaxCount=1, TagSpecifications=[...])` | Launch one EC2 instance; returns instance ID immediately |
+| `get_waiter("instance_running").wait(InstanceIds=[id], WaiterConfig={Delay, MaxAttempts})` | Poll every 5 s until state == running (up to 40 attempts = 200 s) |
+| `describe_instances(InstanceIds=[id])` | Returns full instance metadata including `PublicIpAddress` |
+| `create_bucket(Bucket=name)` | Create S3 bucket; `us-east-1` omits `LocationConstraint` |
+| `put_bucket_tagging(Bucket, Tagging={"TagSet":[...]})` | Apply key-value tags to an S3 bucket |
+| `botocore.exceptions.ClientError` | All AWS API errors — check `exc.response["Error"]["Code"]` |
+
+---
+
+## 12. Phase 4 — Production Terraform Configs (AWS + GCP)
+
+### Goal
+
+Replace the stub/draft Terraform files from Phase 1 with **production-ready, fully parameterised** configurations for both AWS and GCP. Also introduce a canonical shared `variables.tf` that documents every input variable across both modules.
+
+### File Structure After Phase 4
+
+```
+terraform/
+├── aws/
+│   └── main.tf          ← Full AWS config: EC2, S3, security group, outputs
+├── gcp/
+│   └── main.tf          ← Full GCP config: Compute Engine, Cloud Storage, outputs
+└── variables.tf         ← Canonical variable documentation (shared reference)
+```
+
+### `terraform/aws/main.tf` — Key Design Decisions
+
+**Providers pinned:**
+```hcl
+required_providers {
+  aws    = { source = "hashicorp/aws",    version = "~> 5.0" }
+  random = { source = "hashicorp/random", version = "~> 3.6" }
+}
+```
+`~> 5.0` means "5.x but not 6.x" — patch updates are accepted, major versions are not.
+
+**`locals` block for tag merging:**
+```hcl
+locals {
+  common_tags = merge(var.tags, {
+    Project   = var.project_name
+    ManagedBy = "cloudforge"
+    Provider  = "aws"
+  })
+}
+```
+Merging means user-provided tags and CloudForge standard tags coexist. If the user provides a `Project` tag, `merge()` lets the standard one win (rightmost wins in HCL `merge()`).
+
+**`random_id` for bucket uniqueness:**
+```hcl
+resource "random_id" "bucket_suffix" {
+  byte_length = 4
+  keepers = { project_name = var.project_name }
+}
+```
+`keepers` means the random ID is only regenerated when `project_name` changes — not on every `terraform apply`. This prevents accidental bucket deletion on re-apply.
+
+**S3 public access block:**
+```hcl
+resource "aws_s3_bucket_public_access_block" "lab" {
+  bucket                  = aws_s3_bucket.lab.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+```
+Best practice: always block public access unless explicitly needed.
+
+**Outputs:**
+```hcl
+output "instance_id" { value = aws_instance.lab.id }
+output "public_ip"   { value = aws_instance.lab.public_ip }
+output "bucket_name" { value = aws_s3_bucket.lab.id }
+```
+
+### `terraform/gcp/main.tf` — Key Differences from AWS
+
+GCP uses a different terminology:
+
+| AWS concept | GCP equivalent |
+|---|---|
+| EC2 instance | `google_compute_instance` |
+| Instance type (e.g., `t2.micro`) | Machine type (e.g., `f1-micro`) |
+| AMI | Boot disk image (e.g., `debian-cloud/debian-11`) |
+| S3 bucket | `google_storage_bucket` |
+| Tags | Labels (lowercase keys + values, dashes only) |
+| Region | Region (but GCS location must be UPPERCASE) |
+
+**Critical GCP constraints:**
+- Labels must be lowercase: `managed_by = "cloudforge"` not `ManagedBy`
+- `google_storage_bucket` location must be uppercase: `location = upper(var.region)` converts `us-central1` → `US-CENTRAL1`
+- `force_destroy = false` — prevents accidental bucket deletion with objects in it (Terraform would error, which is safer)
+
+**locals for GCP:**
+```hcl
+locals {
+  common_labels = merge(var.tags, {
+    project    = lower(var.project_name)
+    managed_by = "cloudforge"
+    provider   = "gcp"
+  })
+}
+```
+
+### `terraform/variables.tf` — Shared Variable Reference
+
+This file is not used by Terraform directly (each module has its own variable declarations). It is a **human-readable canonical reference** that documents:
+- Which variables are universal (both AWS and GCP)
+- Which are AWS-specific
+- Which are GCP-specific
+- Validation rules (e.g., `project_name` matches `^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$`)
+
+```hcl
+variable "project_name" {
+  description = "Project name used in resource names and labels. Must be lowercase."
+  type        = string
+  validation {
+    condition     = can(regex("^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$", var.project_name))
+    error_message = "project_name must be 3-32 chars, lowercase letters/numbers/dashes only."
+  }
+}
+```
+
+### Why `random_id` instead of a timestamp?
+
+A timestamp like `${formatdate("YYYYMMDDHHmmss", timestamp())}` regenerates on every `apply`, meaning Terraform would try to recreate the bucket every time — which fails if the bucket already exists. `random_id` with `keepers` only regenerates when the keeper value changes.
+
+---
+
+## 13. Phase 5 — Fixture-Based Smoke Test Suite with conftest.py
+
+### Goal
+
+Replace ad-hoc environment-variable-based test setup with a **pytest fixture chain** rooted in `.cloudforge_state.json`. All test functions receive typed, validated fixtures instead of reading `os.environ` directly.
+
+### The Problem with Environment Variables
+
+Phase 1 tests used:
+```python
+LAB_HOST = os.getenv("CLOUDFORGE_PUBLIC_IP", "")
+
+@pytest.mark.skipif(not LAB_HOST, reason="no public IP")
+def test_ssh_port_reachable():
+    socket.create_connection((LAB_HOST, 22))
+```
+
+Problems:
+1. Every test file had its own `os.getenv` calls — duplicated fragile boilerplate
+2. Skip conditions were at the function level — hard to centralise
+3. No guarantee the state file was valid before tests started
+4. Hard to extend with new resource types (would need new env vars in every file)
+
+### The Solution: `conftest.py` with session-scoped fixtures
+
+`tests/smoke/conftest.py` defines a **fixture chain**. pytest auto-discovers `conftest.py` and makes all fixtures in it available to every test in the `tests/smoke/` directory.
+
+```
+resources (session) ← reads .cloudforge_state.json
+    │
+    ├─ instance_ip (session)  ← resources["public_ip"]
+    ├─ instance_id (session)  ← resources["instance_id"]
+    ├─ bucket_name (session)  ← resources["s3_bucket"]
+    └─ aws_region  (session)  ← resources["region"] (default: "us-east-1")
+```
+
+**`scope="session"`** means each fixture is evaluated **once per pytest run** — not once per test. This is crucial: you don't want to re-read and re-validate the JSON file 7 times for 7 tests.
+
+**Skip propagation:** `pytest.skip()` inside a session fixture causes every test that depends on that fixture (directly or indirectly) to be skipped with the same message. So if the state file is missing, all 7 tests are skipped cleanly — no `KeyError` traceback, no misleading FAILED status.
+
+```python
+@pytest.fixture(scope="session")
+def resources() -> dict:
+    if not _STATE_FILE.exists():
+        pytest.skip(f"State file '{_STATE_FILE}' not found. Run cloudforge provision first.")
+    try:
+        data = json.loads(_STATE_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        pytest.skip(f"State file is not valid JSON: {exc}")
+    return data
+
+@pytest.fixture(scope="session")
+def instance_ip(resources: dict) -> str:
+    ip = resources.get("public_ip", "")
+    if not ip:
+        pytest.skip("'public_ip' not found in state file")
+    return ip
+```
+
+### The `.cloudforge_state.json` State File
+
+Written by `AWSProvisioner._write_state_file()` after a successful `provision()` call:
+
+```json
+{
+  "instance_id": "i-0abc123def456789",
+  "public_ip": "54.123.45.67",
+  "s3_bucket": "cloudforge-my-test-lab-a1b2c3d4",
+  "launch_time": 47.83,
+  "region": "us-east-1"
+}
+```
+
+- `launch_time` — total seconds from `time.monotonic()` start to waiter completion
+- `region` — copied from `spec.region` so tests know which region without re-reading the spec
+- Listed in `.gitignore` — contains live resource IDs; never commit
+
+### New Test Files
+
+#### `tests/smoke/test_connectivity.py` (rewritten)
+
+Tests that use **`instance_ip`** and **`bucket_name`** fixtures:
+
+| Test | Fixture | What it does |
+|---|---|---|
+| `test_ssh_port_open` | `instance_ip` | TCP connect to port 22, 3s timeout |
+| `test_http_port_open` | `instance_ip` | TCP connect to port 80, 3s timeout |
+| `test_s3_bucket_exists` | `bucket_name` | `head_bucket()` — 404 vs 403 distinction |
+
+**`_tcp_probe(host, port, timeout)`** distinguishes three failure modes:
+- `socket.timeout` → firewall/security group blocking the port
+- `ConnectionRefusedError` → port reached but no daemon listening
+- `OSError` → general network failure (routing, DNS)
+
+#### `tests/smoke/test_api.py` (rewritten)
+
+| Test | Fixtures | What it does |
+|---|---|---|
+| `test_aws_describe_instance` | `instance_id`, `aws_region` | `describe_instances()` asserts `State.Name == "running"` |
+| `test_s3_put_get` | `bucket_name` | PUT → GET → assert body matches → DELETE in `finally` |
+
+`test_s3_put_get` uses `uuid.uuid4()` for the key to avoid collision across parallel runs. The DELETE is in a `finally` block so cleanup always happens even if the GET assertion fails.
+
+#### `tests/smoke/test_performance.py` (new)
+
+| Test | Fixture | Threshold | What it does |
+|---|---|---|---|
+| `test_instance_launch_time` | `resources` | < 300 s | Reads `launch_time` from state dict; skips if key absent |
+| `test_s3_latency` | `bucket_name` | < 2.0 s | Times a 1 KB PUT; DELETE in finally (not timed) |
+
+Why skip (not fail) if `launch_time` is absent? Older state files (from before Phase 5) won't have this key. Skipping is honest — the test simply can't run — while failing would be misleading.
+
+### `provisioner.py` additions
+
+```python
+# In provision() after tag_resources():
+elapsed = time.monotonic() - start
+self.resources["launch_time"] = round(elapsed, 2)
+self.resources["region"]      = self.spec.region
+self._write_state_file()
+
+def _write_state_file(self) -> None:
+    state_path = Path(".cloudforge_state.json")
+    state_path.write_text(
+        json.dumps(self.resources, indent=2, default=str),
+        encoding="utf-8",
+    )
+```
+
+`default=str` in `json.dumps` handles any non-serialisable types (e.g., `datetime`) by converting to string — defensive coding.
+
+### pytest `pytestmark`
+
+```python
+pytestmark = pytest.mark.smoke
+```
+
+At module level in each test file. This applies the `smoke` marker to every test in the file without decorating each function individually. You can then run only smoke tests with:
+```bash
+pytest -m smoke
+```
+
+---
+
+## 14. Phase 6 — Polished CLI (--spec flags, --dry-run, boto3 teardown, JSON report)
+
+### Goal
+
+Make the CLI production-ready:
+1. Consistent `--spec` named option across all commands
+2. `--dry-run` for `provision` — preview without touching AWS
+3. Rich table output for every command
+4. `teardown` command using boto3 (not Terraform)
+5. `cloudforge run` always writes `cloudforge_report.json`
+6. `validate` shows full spec in a table
+
+### CLI Command Reference (Phase 6 Final)
+
+| Command | Key flags | What it does |
+|---|---|---|
+| `cloudforge provision --spec lab.yaml` | `--dry-run` | Provision lab; print resource table; save state file |
+| `cloudforge test --spec lab.yaml` | — | Load state file; run pytest suites; print pass/fail table |
+| `cloudforge teardown --spec lab.yaml` | — | Terminate EC2, delete S3, remove state file via boto3 |
+| `cloudforge run --spec lab.yaml` | `--no-teardown`, `--json-report`, `--html-report` | Full lifecycle; always writes `cloudforge_report.json` |
+| `cloudforge validate --spec lab.yaml` | — | Validate YAML spec; print field table; exit 0/1 |
+
+### Why `--spec` instead of a positional argument?
+
+Phase 1–5 used positional args: `cloudforge provision examples/lab.yaml`.  
+Phase 6 changes to named options: `cloudforge provision --spec examples/lab.yaml`.
+
+Reasons:
+- **Explicit over implicit** — `--spec` makes it clear what the file *is*; a bare path is ambiguous
+- **Shell tab completion** — Click's option completion works better than bare argument completion
+- **CI readability** — `--spec "$SPEC_FILE"` is self-documenting in pipeline YAML
+- **Extensibility** — future options like `--override region=eu-west-1` need the arg to be named to avoid positional ordering ambiguity
+
+### `provision --dry-run`
+
+```
+cloudforge provision --spec examples/lab.yaml --dry-run
+```
+
+Prints a Rich "Planned Resources (Dry Run)" table:
+
+| Resource | Planned Value |
+|---|---|
+| Provider | aws |
+| Region | us-east-1 |
+| EC2 Instance Type | t2.micro |
+| Root Volume | 10 GB |
+| S3 Bucket Name | cloudforge-my-test-lab-\<random8hex\> |
+| EC2 Tags | project=cloudforge, env=test, ManagedBy=cloudforge, Lab=my-test-lab |
+| State File | .cloudforge_state.json |
+
+No AWS API calls are made. This lets you sanity-check what a spec will create before committing.
+
+### `test` command — state file + Rich table
+
+The `test` command now:
+1. Calls `_load_state_file()` — exits 1 with a clear message if absent
+2. Displays `instance_id` and `s3_bucket` from the state before running
+3. Runs `run_suites()` (pytest as subprocess for each suite in spec)
+4. Renders a Rich table with per-suite: name, passed, failed, skipped, duration, PASS/FAIL badge
+5. Prints aggregate totals (total passed / failed across all suites)
+
+```
+┌──────────────────────────────────────────────┐
+│               Test Results                   │
+├──────────────────┬──────┬──────┬─────┬───────┤
+│ Suite            │Passed│Failed│Skip │Status │
+├──────────────────┼──────┼──────┼─────┼───────┤
+│test_connectivity │  3   │  0   │  0  │ PASS  │
+│test_api          │  2   │  0   │  0  │ PASS  │
+│test_performance  │  2   │  0   │  0  │ PASS  │
+└──────────────────┴──────┴──────┴─────┴───────┘
+Tests: ALL PASSED
+passed=7  failed=0  (12.4s)
+```
+
+### `teardown` — boto3 instead of Terraform
+
+**Old approach (Phases 1–5):**
+```python
+subprocess.run(["terraform", "destroy", "-auto-approve", ...])
+```
+Requires Terraform installed, `.tfstate` to exist, working directory to be correct.
+
+**New approach (Phase 6):**
+```python
+ec2.terminate_instances(InstanceIds=[instance_id])
+waiter = ec2.get_waiter("instance_terminated")
+waiter.wait(InstanceIds=[instance_id], WaiterConfig={"Delay": 5, "MaxAttempts": 60})
+
+paginator = s3.get_paginator("list_objects_v2")
+for page in paginator.paginate(Bucket=bucket_name):
+    s3.delete_objects(Bucket=bucket_name, Delete={"Objects": [...]})
+s3.delete_bucket(Bucket=bucket_name)
+```
+
+**Why terminate first, then bucket?**
+There's no hard dependency order here. Both are independent resources. We terminate EC2 first because it takes longer (waiter blocks for up to 5 minutes). S3 deletion is near-instant once the objects are emptied.
+
+**Why empty the bucket before deleting?**
+AWS requires a bucket to be empty before `delete_bucket()` succeeds. `list_objects_v2` is paginated (returns max 1000 objects per page) so the code paginates through all pages with a paginator.
+
+**Non-fatal warnings:**
+- `InvalidInstanceID.NotFound` → instance was already terminated; log warning, continue
+- `NoSuchBucket` / HTTP 404 → bucket was already deleted; log warning, continue
+
+**State file removal:**
+On a clean teardown (no errors), `.cloudforge_state.json` is deleted. On partial failure, the file is retained so the operator can inspect which resource IDs still need manual cleanup.
+
+### `run` — `cloudforge_report.json`
+
+`cloudforge run` always writes `cloudforge_report.json` in the current working directory:
+```python
+_DEFAULT_REPORT = Path("cloudforge_report.json")
+_DEFAULT_REPORT.write_text(json.dumps(report, indent=2), encoding="utf-8")
+```
+
+The report contains the full lifecycle outcome:
+```json
+{
+  "lab_name": "my-test-lab",
+  "provider": "aws",
+  "generated_at": "2026-05-22T10:30:00+00:00",
+  "overall_success": true,
+  "provision": { "success": true, "elapsed_seconds": 47.8, "outputs": {...} },
+  "tests": { "success": true, "total_passed": 7, "total_failed": 0, "suites": [...] },
+  "teardown": { "success": true, "elapsed_seconds": 62.3 }
+}
+```
+
+`--json-report` / `--html-report` additionally save timestamped copies to `reports/` (useful for archiving multiple runs).
+
+### `validate` — Rich table
+
+Old output:
+```
+Valid — lab=my-test-lab provider=aws
+  Instance:  t2.micro in us-east-1
+  Storage:   10 GB
+```
+
+New output (Phase 6):
+```
+┌──────────────────────────────────────────┐
+│          Spec Validation — OK ✓          │
+├────────────────────┬─────────────────────┤
+│ Field              │ Value               │
+├────────────────────┼─────────────────────┤
+│ Name               │ my-test-lab         │
+│ Provider           │ aws                 │
+│ Region             │ us-east-1           │
+│ Instance Type      │ t2.micro            │
+│ Storage            │ 10 GB               │
+│ Tests              │ connectivity, api   │
+│ Teardown on Success│ True                │
+│ Teardown on Failure│ False               │
+│ Tags               │ project=cloudforge  │
+└────────────────────┴─────────────────────┘
+✓ Spec is valid  examples/lab.yaml
+```
+
+---
+
+## 15. Complete Data Flow — Phase 6 Final State
+
+```
+cloudforge run --spec examples/lab.yaml
+  │
+  ├─ load_spec("examples/lab.yaml")                    ← schema.py
+  │    └─ yaml.safe_load() → LabSpec.model_validate()
+  │
+  ├─ get_provisioner(spec.provider, spec)              ← provisioner.py
+  │    └─ Returns AWSProvisioner(spec)
+  │
+  ├─ _run_provision(provisioner, spec)                 ← cli.py helper
+  │    └─ AWSProvisioner.provision()
+  │         ├─ _launch_ec2()          → boto3: run_instances
+  │         ├─ _wait_for_running()    → boto3: get_waiter("instance_running")
+  │         ├─ _fetch_public_ip()     → boto3: describe_instances
+  │         ├─ _create_s3_bucket()    → boto3: create_bucket
+  │         ├─ tag_resources()        → boto3: create_tags + put_bucket_tagging
+  │         └─ _write_state_file()   → .cloudforge_state.json
+  │    → ProvisionResult(success=True, outputs={instance_id, public_ip, ...})
+  │
+  ├─ _print_provision_table(result.outputs)            ← cli.py helper → Rich table
+  │
+  ├─ run_suites(spec, outputs)                         ← runner.py
+  │    ├─ _build_env(outputs) → os.environ + CLOUDFORGE_* vars
+  │    └─ for each test_name in spec.tests:
+  │         ├─ _resolve_path(name) → "tests/smoke/test_api.py"
+  │         ├─ subprocess: python -m pytest tests/smoke/test_api.py -v
+  │         └─ _parse_pytest_output() → SuiteResult(passed=2, ...)
+  │    → RunResult(suites=[...])
+  │
+  ├─ run_teardown(spec)                                ← teardown.py
+  │    ├─ _read_state() → load .cloudforge_state.json
+  │    ├─ _aws_terminate_instance() → boto3 terminate + waiter
+  │    ├─ _aws_delete_bucket()      → boto3 paginate + delete_objects + delete_bucket
+  │    └─ _STATE_FILE.unlink()      → remove .cloudforge_state.json
+  │    → TeardownResult(success=True, ...)
+  │
+  ├─ build_report(...)                                 ← reporter.py
+  │    → dict with provision + tests + teardown sections
+  │
+  ├─ print_summary(report)                             ← reporter.py Rich table
+  ├─ cloudforge_report.json.write_text(...)            ← always written
+  ├─ save_json(report, "reports/")                     ← only if --json-report
+  └─ save_html(report, "reports/")                     ← only if --html-report
+```
+
+---
+
+## 16. Git History — All Six Phases
+
+| Commit | Tag | What was built |
+|---|---|---|
+| `97ada3d` | Phase 1 | Full project scaffold: CLI, provisioner, runner, reporter, teardown, Terraform stubs, smoke tests, pyproject.toml |
+| `152cc74` | Phase 2 | Flat Pydantic v2 `LabSpec`; `load_spec()`; `CloudProvider` enum; `@field_validator`; updated all consumers |
+| `93d4fab` | Phase 3 | Direct boto3 `AWSProvisioner`: `run_instances`, `get_waiter`, `create_bucket`; `_run_provision()` wrapper in CLI |
+| `06df9df` | Phase 4 | Production `terraform/aws/main.tf` + `terraform/gcp/main.tf`; `terraform/variables.tf`; `locals`, `merge()`, `random_id`, `keepers` |
+| `f07c583` | Phase 5 | `tests/smoke/conftest.py` fixture chain; rewritten `test_connectivity.py` + `test_api.py`; new `test_performance.py`; `_write_state_file()` in provisioner |
+| `f33f625` | Phase 6 | `--spec` flags everywhere; `--dry-run`; Rich tables; boto3 `teardown.py`; `cloudforge_report.json` |
+
+---
+
+## 17. Dependencies — What to Install
+
+```toml
+# pyproject.toml [project.dependencies]
+click>=8.1
+pydantic>=2.7
+boto3>=1.34
+pyyaml>=6.0
+rich>=13.7
+jinja2>=3.1
+pytest>=8.2
+
+# [project.optional-dependencies] dev
+pytest-cov
+ruff
+mypy
+boto3-stubs[ec2,s3,iam]
+```
+
+Install in a virtual environment:
+```bash
+python -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -e ".[dev]"
+```
+
+---
+
+## 18. Key Design Decisions — Phases 3–6
+
+### Why no `moto` in Phase 3?
+
+`moto` is the AWS mocking library for unit tests. Phase 3 focused on getting real AWS calls working — mocking would have hidden API shape mistakes. Moto tests are a natural Phase 7 addition once the real-world behavior is validated.
+
+### Why separate `_write_state_file()` in Phase 5 instead of env vars?
+
+The conftest.py fixtures need resource IDs **before pytest starts** (session fixtures run at collection time). Environment variables set by the parent process are fine, but they require the parent to know the IDs — which means the runner would need to inject them. A file is simpler: the provisioner writes it, the fixtures read it, no coordination needed.
+
+### Why `scope="session"` for all conftest fixtures?
+
+If `scope="function"` (default), each test would re-read and re-validate the JSON file. With 7 tests across 3 files, that's 7 file reads. Session scope reads once and shares the dict. More importantly: a `pytest.skip()` in a function-scoped fixture only skips that one test; in a session fixture it propagates to all dependents, which is the correct behavior when the entire lab doesn't exist.
+
+### Why keep `run_suites()` as subprocess instead of `pytest.main()`?
+
+`pytest.main()` runs in the same process. A test that calls `sys.exit()` or has an uncaught exception can crash CloudForge. Subprocess isolation means:
+1. A crashing test doesn't crash the provisioner
+2. stdout/stderr are captured cleanly for `_parse_pytest_output()`
+3. Environment variables (`CLOUDFORGE_*`) can be injected into just the test process
+
+### Why always write `cloudforge_report.json` in Phase 6?
+
+Before Phase 6, the report was only written if you passed `--json-report`. This meant silent runs produced no artifact — hard to audit or debug. A fixed-name file in the working directory is always there after `cloudforge run`, making it easy to `cat cloudforge_report.json` or `jq '.overall_success'` in a CI pipeline without any flags.
+
+### Why rename `destroy` to `teardown`?
+
+`destroy` is Terraform's terminology. Since Phase 6 tears down via boto3 (not Terraform), `teardown` is the more accurate and provider-agnostic name. It also matches the `teardown_on_success` / `teardown_on_failure` field names in the spec.
+
+---
+
+*Last updated: Phase 6 — May 2026*  
+*Repository: https://github.com/shashank8walke/cloudforge*
